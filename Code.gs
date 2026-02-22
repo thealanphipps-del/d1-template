@@ -1,154 +1,81 @@
-/**
- * FORENSIC HUB MASTER ENGINE v3.0
- * Everything in one file to prevent "Not Defined" errors.
- */
-
-// --- GLOBAL CONFIGURATION ---
-var FOLDER_ID = "1DwZwSjqcbsTgtJy9eesZV8RoT6xY9C2z";
-var MODEL_NAME = "gemini-2.0-flash";
+// The Folder ID for "My Stuff"
+const FOLDER_ID = '1DwZwSjqcbsTgtJy9eesZV8RoT6xY9C2z'; 
 
 /**
- * 1. MAIN EXECUTION LOOP
- * This is the function you set the 1-minute trigger for.
+ * MAIN EXECUTION LOOP
+ * Use this function for your 1-minute trigger.
  */
 function ingestAndAnalyzeTakeout() {
+  console.log("--- Starting Execution: ingestAndAnalyzeTakeout ---");
+  
   try {
-    unpackTakeoutZips(); // Clean up any new ZIPs first
+    // 1. Optional: Handle ZIP files first if you have the unpack script
+    if (typeof unpackTakeoutZips === "function") {
+      console.log("Checking for ZIP files...");
+      unpackTakeoutZips(); 
+    }
     
+    // 2. Initialize Drive and Properties
     var mainFolder = DriveApp.getFolderById(FOLDER_ID);
-    var caseFolders = mainFolder.getFolders();
     var scriptProperties = PropertiesService.getScriptProperties();
+    
+    // Retrieve the fingerprint vault to avoid re-processing files
     var fingerprintVault = scriptProperties.getProperty('FILE_FINGERPRINTS') || "";
+    var initialVaultLength = fingerprintVault.length;
+    console.log("Vault loaded. Current size: " + initialVaultLength + " characters.");
 
-    while (caseFolders.hasNext()) {
-      var folder = caseFolders.next();
-      var caseNumber = folder.getName();
-      var files = folder.getFiles();
-      var caseData = "";
-      var newFilesCount = 0;
+    // 3. Start the Recursive Crawl
+    // This will visit "Case-260002", "Takeout", and every folder inside them.
+    var updatedVault = digestFolderRecursive(mainFolder, fingerprintVault);
 
-      while (files.hasNext()) {
-        var file = files.next();
-        var fingerprint = caseNumber + "_" + file.getName() + "_" + file.getSize();
-        
-        // Skip if we've already analyzed this exact file
-        if (fingerprintVault.indexOf(fingerprint) !== -1) continue;
-
-        var mime = file.getMimeType();
-        if (mime.includes('text') || mime.includes('json') || file.getName().endsWith('.log')) {
-          caseData += "\n[SOURCE: " + file.getName() + "]\n" + file.getBlob().getDataAsString() + "\n";
-          fingerprintVault += (fingerprintVault ? "|" : "") + fingerprint;
-          newFilesCount++;
-        }
-      }
-
-      if (newFilesCount > 0) {
-        var prompt = "Perform a forensic anomaly detection on this data for Case: " + caseNumber + ". Look for location spoofing, timestamp gaps, or unusual activity.";
-        var analysis = callGeminiAI(caseData, prompt);
-        sendPushoverNotification("Forensic Hub: " + caseNumber, analysis);
-      }
+    // 4. Save updated vault back to Script Properties
+    if (updatedVault.length > initialVaultLength) {
+      scriptProperties.setProperty('FILE_FINGERPRINTS', updatedVault);
+      console.log("Crawl complete. Vault updated with new files.");
+    } else {
+      console.log("Crawl complete. No new files detected.");
     }
-    
-    // Save state (limit vault size to 500 entries)
-    var vaultArray = fingerprintVault.split('|').slice(-500); 
-    scriptProperties.setProperty('FILE_FINGERPRINTS', vaultArray.join('|'));
-    
+
   } catch (e) {
-    console.error("Ingest Failed: " + e.toString());
+    console.error("ERROR: " + e.toString());
+    console.error("Stack: " + e.stack);
   }
+  
+  console.log("--- Execution Finished ---");
 }
 
 /**
- * 2. GEMINI AI CONNECTION
+ * RECURSIVE CRAWLER
+ * Digs into every subfolder level found within "My Stuff"
  */
-function callGeminiAI(content, prompt) {
-  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-  var url = "https://generativelanguage.googleapis.com/v1beta/models/" + MODEL_NAME + ":generateContent?key=" + apiKey;
+function digestFolderRecursive(folder, fingerprintVault) {
+  var folderName = folder.getName();
+  console.log("Scanning Folder: [" + folderName + "]");
   
-  var payload = {
-    "contents": [{
-      "parts": [{
-        "text": prompt + "\n\nDATA TO ANALYZE:\n" + content
-      }]
-    }]
-  };
-  
-  var options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
-  };
+  // 1. Process all files in the current folder
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    var file = files.next();
+    var fileName = file.getName();
+    var fileFingerprint = file.getId() + "_" + fileName;
 
-  var response = UrlFetchApp.fetch(url, options);
-  var json = JSON.parse(response.getContentText());
-  
-  if (json.candidates && json.candidates[0]) {
-    return json.candidates[0].content.parts[0].text;
-  } else {
-    return "AI Analysis failed: " + response.getContentText();
-  }
-}
-
-/**
- * 3. PUSHOVER NOTIFICATIONS
- */
-function sendPushoverNotification(title, message) {
-  var userKey = PropertiesService.getScriptProperties().getProperty('PUSHOVER_USER_KEY');
-  var token = PropertiesService.getScriptProperties().getProperty('PUSHOVER_APP_TOKEN');
-  
-  UrlFetchApp.fetch("https://api.pushover.net/1/messages.json", {
-    "method": "post",
-    "payload": {
-      "token": token,
-      "user": userKey,
-      "title": title,
-      "message": message.substring(0, 1000) // Pushover limit is ~1000 chars
-    }
-  });
-}
-
-/**
- * 4. ZIP EXTRACTION UTILITY
- */
-function unpackTakeoutZips() {
-  var folder = DriveApp.getFolderById(FOLDER_ID);
-  var zips = folder.getFilesByType(MimeType.ZIP);
-  
-  while (zips.hasNext()) {
-    var zipFile = zips.next();
-    try {
-      var unzippedFiles = Utilities.unzip(zipFile.getBlob());
-      unzippedFiles.forEach(function(fileBlob) {
-        folder.createFile(fileBlob);
-      });
-      // Move ZIP to a 'Processed' folder so we don't unzip it forever
-      var processedFolder;
-      var sub = folder.getFoldersByName("Processed_Zips");
-      processedFolder = sub.hasNext() ? sub.next() : folder.createFolder("Processed_Zips");
-      zipFile.moveTo(processedFolder);
-    } catch (e) {
-      console.error("Unzip failed for " + zipFile.getName() + ": " + e.toString());
+    if (fingerprintVault.indexOf(fileFingerprint) === -1) {
+      console.log("  + New file found: " + fileName);
+      
+      // --- DATA EXTRACTION POINT ---
+      // This is where you would call functions to read .json or .html content
+      // ------------------------------
+      
+      fingerprintVault += fileFingerprint + ",";
     }
   }
-}
 
-/**
- * 5. INITIAL SETUP (RUN THIS ONCE)
- */
-function INITIAL_SETUP() {
-  PropertiesService.getScriptProperties().setProperties({
-    'GEMINI_API_KEY': 'YOUR_GEMINI_KEY_HERE',
-    'PUSHOVER_USER_KEY': 'YOUR_USER_KEY_HERE',
-    'PUSHOVER_APP_TOKEN': 'YOUR_APP_TOKEN_HERE'
-  });
-  console.log("Setup Complete. Keys stored.");
-}
-
-/**
- * 6. RESET (USE IF NOTIFICATIONS STOP)
- */
-function RESET_INGESTION_HISTORY() {
-  PropertiesService.getScriptProperties().deleteProperty('FILE_FINGERPRINTS');
-  console.log("Memory cleared. Ready for full re-scan.");
+  // 2. Find subfolders and repeat the process (Recursion)
+  var subfolders = folder.getFolders();
+  while (subfolders.hasNext()) {
+    var subFolder = subfolders.next();
+    fingerprintVault = digestFolderRecursive(subFolder, fingerprintVault);
+  }
+  
+  return fingerprintVault;
 }
